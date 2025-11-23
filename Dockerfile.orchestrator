@@ -21,9 +21,8 @@ COPY orchestrator ./orchestrator
 COPY agents ./agents
 COPY context ./context
 COPY tools ./tools
-COPY generated ./generated
 
-# Create necessary directories
+# Create necessary directories (generated content is created at runtime)
 RUN mkdir -p generated/artifacts generated/app/backend generated/app/frontend
 
 # Expose port
