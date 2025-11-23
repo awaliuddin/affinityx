@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './ProjectProgress.css';
+import { WorkflowVisualization } from './WorkflowVisualization';
 
 interface Task {
   task_id: string;
@@ -112,6 +113,9 @@ export const ProjectProgress: React.FC<ProjectProgressProps> = ({ projectId, onR
           </button>
         )}
       </div>
+
+      {/* Real-time agent workflow visualization */}
+      <WorkflowVisualization projectId={projectId} />
 
       <div className="task-timeline">
         {project.task_graph.map((task, index) => (

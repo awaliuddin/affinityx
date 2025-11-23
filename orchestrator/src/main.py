@@ -1,9 +1,10 @@
 """
 Main FastAPI application for the AI Product Studio Orchestrator.
 """
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+import asyncio
 
 from orchestrator.src.models import (
     CreateProjectRequest,
@@ -15,6 +16,7 @@ from orchestrator.src.models import (
 from orchestrator.src.task_graph import create_phase1_task_graph
 from orchestrator.src.orchestration import run_next_available_task
 from orchestrator.src.agent_runtime import AgentRuntime
+from orchestrator.src.websocket_manager import manager
 from context.src.database import get_db, init_db
 from context.src.context_api import load_project_state, save_project_state
 
@@ -186,6 +188,18 @@ async def execute_all_tasks(
 
     for _ in range(max_iterations):
         try:
+            # Broadcast start of task execution
+            next_task = None
+            for task in project.task_graph:
+                if task.status == "pending":
+                    next_task = task
+                    break
+
+            if next_task:
+                await manager.broadcast_agent_start(
+                    project_id, next_task.task_id, next_task.agent, next_task.kind
+                )
+
             response = run_next_available_task(project_id, db, agent_runtime)
 
             if response is None:
@@ -196,6 +210,15 @@ async def execute_all_tasks(
                 "agent": response.agent,
                 "status": response.status,
             })
+
+            # Broadcast task completion
+            await manager.broadcast_agent_complete(
+                project_id, response.task_id, response.agent, response.status, response.result
+            )
+
+            # Broadcast updated project state
+            project = load_project_state(project_id, db)
+            await manager.broadcast_project_update(project_id, project.model_dump())
 
         except StopIteration:
             break
@@ -213,4 +236,88 @@ async def execute_all_tasks(
         "project_id": project_id,
         "executed_tasks": executed_tasks,
         "project": final_project,
+    }
+
+
+@app.websocket("/ws/{project_id}")
+async def websocket_endpoint(websocket: WebSocket, project_id: str):
+    """
+    WebSocket endpoint for real-time project updates.
+
+    Clients can connect to this endpoint to receive live updates
+    about agent execution, task progress, and project state changes.
+    """
+    await manager.connect(websocket, project_id)
+
+    try:
+        # Send initial project state
+        db = next(get_db())
+        project = load_project_state(project_id, db)
+        if project:
+            await websocket.send_json({
+                "type": "initial_state",
+                "project": project.model_dump(),
+            })
+
+        # Keep connection alive and handle incoming messages
+        while True:
+            data = await websocket.receive_text()
+            # Echo back for heartbeat
+            await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, project_id)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket, project_id)
+
+
+@app.get("/llm/providers")
+async def list_llm_providers():
+    """List available LLM providers and their status"""
+    from orchestrator.src.llm.factory import LLMFactory
+    from orchestrator.src.llm.base import LLMProvider
+    import os
+
+    providers = []
+
+    for provider in LLMProvider:
+        status = "unavailable"
+        config_needed = []
+
+        if provider == LLMProvider.OPENAI:
+            if os.getenv("OPENAI_API_KEY"):
+                status = "available"
+            else:
+                config_needed.append("OPENAI_API_KEY")
+
+        elif provider == LLMProvider.CLAUDE:
+            if os.getenv("ANTHROPIC_API_KEY"):
+                status = "available"
+            else:
+                config_needed.append("ANTHROPIC_API_KEY")
+
+        elif provider == LLMProvider.OLLAMA:
+            try:
+                import httpx
+                response = httpx.get("http://localhost:11434/api/tags", timeout=2.0)
+                if response.status_code == 200:
+                    status = "available"
+            except:
+                config_needed.append("Ollama server not running")
+
+        elif provider == LLMProvider.MOCK:
+            status = "available"
+
+        providers.append({
+            "provider": provider.value,
+            "status": status,
+            "config_needed": config_needed,
+        })
+
+    current_provider = os.getenv("LLM_PROVIDER", "mock")
+
+    return {
+        "providers": providers,
+        "current": current_provider,
     }
